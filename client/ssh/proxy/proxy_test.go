@@ -3,10 +3,13 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"testing"
+	"time"
 
+	"github.com/gliderlabs/ssh"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	cryptossh "golang.org/x/crypto/ssh"
@@ -87,6 +90,65 @@ func TestSSHProxy_verifyHostKey(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "peer unknown-host not found in network")
 	})
+}
+
+func TestSSHProxy_ForwardsInitialPTYSize(t *testing.T) {
+	want := ssh.Window{Width: 120, Height: 34}
+	initialWindow := make(chan ssh.Window, 1)
+	backend := dialPTYTestServer(t, &ssh.Server{
+		Handler: func(ssh.Session) {},
+		PtyCallback: func(_ ssh.Context, pty ssh.Pty) bool {
+			initialWindow <- pty.Window
+			// Reject the PTY after capture so the test server never queues resize events.
+			return false
+		},
+	})
+
+	proxy := &SSHProxy{backendClient: backend, stderr: io.Discard}
+	frontend := dialPTYTestServer(t, &ssh.Server{Handler: proxy.handleSSHSession})
+	session, err := frontend.NewSession()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = session.Close() })
+
+	require.NoError(t, session.RequestPty("xterm", want.Height, want.Width, nil))
+	require.NoError(t, session.Run("check-pty"))
+	select {
+	case got := <-initialWindow:
+		assert.Equal(t, want, got, "backend should receive the requested initial PTY size")
+	default:
+		t.Fatal("backend did not receive an initial PTY request")
+	}
+}
+
+func dialPTYTestServer(t *testing.T, server *ssh.Server) *cryptossh.Client {
+	t.Helper()
+
+	signer, err := generateHostKey()
+	require.NoError(t, err)
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	server.HostSigners = []ssh.Signer{signer}
+	t.Cleanup(func() { _ = server.Close() })
+	go func() {
+		_ = server.Serve(listener)
+	}()
+
+	addr := listener.Addr().String()
+	conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+
+	clientConn, chans, reqs, err := cryptossh.NewClientConn(conn, addr, &cryptossh.ClientConfig{
+		User:            "test",
+		HostKeyCallback: cryptossh.FixedHostKey(signer.PublicKey()),
+	})
+	require.NoError(t, err)
+	client := cryptossh.NewClient(clientConn, chans, reqs)
+	t.Cleanup(func() { _ = client.Close() })
+	return client
 }
 
 type mockDaemonServer struct {

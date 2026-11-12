@@ -166,7 +166,7 @@ func (p *SSHProxy) handleSSHSession(session ssh.Session) {
 	serverSession.Stderr = session.Stderr()
 
 	if isPty {
-		if err := serverSession.RequestPty(ptyReq.Term, ptyReq.Window.Width, ptyReq.Window.Height, nil); err != nil {
+		if err := serverSession.RequestPty(ptyReq.Term, ptyReq.Window.Height, ptyReq.Window.Width, nil); err != nil {
 			log.Debugf("PTY request to backend: %v", err)
 		}
 
